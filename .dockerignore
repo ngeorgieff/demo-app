@@ -1,0 +1,10 @@
+.git
+.github
+.venv
+__pycache__
+*.pyc
+tests
+requirements-dev.txt
+.pytest_cache
+k8s
+*.md

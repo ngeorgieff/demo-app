@@ -1,0 +1,137 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/ngeorgieff/demo-app
+  GITOPS_REPO: git@github.com:ngeorgieff/k3s-gitops.git
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with: {python-version: "3.14"}
+      - name: Install pinned dependencies
+        run: pip install --no-input -r requirements.txt -r requirements-dev.txt
+      - name: Validate application configuration
+        run: |
+          python -m compileall -q app
+          test -s VERSION && grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' VERSION
+      - name: Unit tests
+        run: python -m pytest -q
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write          # only exercised on pushes to main
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Compute metadata
+        id: meta
+        run: |
+          echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - name: Build image (local, not pushed)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.version }}
+            GIT_SHA=${{ github.sha }}
+            BUILD_TIME=${{ steps.meta.outputs.built }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test the built image
+        run: |
+          docker run --detach --name smoke --read-only --cap-drop ALL -p 8080:8080 "$IMAGE:${{ steps.meta.outputs.tag }}"
+          for i in $(seq 1 20); do curl -fsS localhost:8080/readyz && break; sleep 1; done
+          curl -fsS localhost:8080/version | grep -q "${GITHUB_SHA}"
+          docker rm -f smoke
+      - name: Vulnerability scan (fail on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish image and capture digest
+        id: push
+        if: github.event_name == 'push'
+        run: |
+          docker push "$IMAGE:${{ steps.meta.outputs.tag }}"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:${{ steps.meta.outputs.tag }}" | cut -d@ -f2)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Published $IMAGE@$digest" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-dev:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency: {group: gitops-dev-update, cancel-in-progress: false}
+    steps:
+      - name: Update dev overlay in the GitOps repository
+        env:
+          DIGEST: ${{ needs.build.outputs.digest }}
+          DEPLOY_KEY: ${{ secrets.GITOPS_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "bad digest: $DIGEST"; exit 1; }
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/gitops_key && chmod 600 ~/.ssh/gitops_key
+          ssh-keyscan -t ed25519 github.com > ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/gitops_key -o IdentitiesOnly=yes"
+          git clone --depth 1 "$GITOPS_REPO" gitops
+          cd gitops
+          f=apps/demo-app/overlays/dev/kustomization.yaml
+          sed -i -E "s|(digest: )sha256:[0-9a-f]{64}|\1${DIGEST}|" "$f"
+          if git diff --quiet; then echo "dev already at $DIGEST; nothing to do"; rm -f ~/.ssh/gitops_key; exit 0; fi
+          git config user.name  "demo-app-ci[bot]"
+          git config user.email "demo-app-ci@users.noreply.github.com"
+          git commit -am "deploy(demo-app/dev): ${GITHUB_SHA::12} -> ${DIGEST::19}" \
+                     -m "Source: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}" \
+                     -m "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          for i in 1 2 3; do git push origin HEAD:main && break || git pull --rebase origin main; done
+          rm -f ~/.ssh/gitops_key
+
+  verify-published:
+    if: github.event_name == 'push'
+    needs: [build, deploy-dev]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Pull by digest, anonymously, and run the artifact dev will deploy
+        run: |
+          # Proves the image is pullable without credentials, as the cluster pulls it.
+          docker pull "$IMAGE@${{ needs.build.outputs.digest }}"
+          docker run --detach --name v -p 8080:8080 "$IMAGE@${{ needs.build.outputs.digest }}"
+          for i in $(seq 1 20); do curl -fsS localhost:8080/healthz && break; sleep 1; done
+          curl -fsS localhost:8080/version
