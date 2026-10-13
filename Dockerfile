@@ -1,7 +1,7 @@
 FROM python:3.14-slim AS deps
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 COPY requirements.txt .
-RUN python -m venv /opt/venv && /opt/venv/bin/pip install -r requirements.txt
+RUN python -m venv --without-pip /opt/venv && pip --python /opt/venv/bin/python install -r requirements.txt
 
 FROM python:3.14-slim
 ARG APP_VERSION=0.0.0-dev
@@ -9,6 +9,8 @@ ARG GIT_SHA=unknown
 ARG BUILD_TIME=unknown
 ENV PATH=/opt/venv/bin:$PATH PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
     APP_VERSION=$APP_VERSION GIT_SHA=$GIT_SHA BUILD_TIME=$BUILD_TIME
+# Package managers are build-time only; dropping them also drops their vendored libraries.
+RUN python -m pip uninstall -y pip setuptools wheel
 COPY --from=deps /opt/venv /opt/venv
 WORKDIR /srv
 COPY app ./app
