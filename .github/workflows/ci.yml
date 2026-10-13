@@ -132,6 +132,6 @@ jobs:
         run: |
           # Proves the image is pullable without credentials, as the cluster pulls it.
           docker pull "$IMAGE@${{ needs.build.outputs.digest }}"
-          docker run --detach --name v -p 8080:8080 "$IMAGE@${{ needs.build.outputs.digest }}"
+          docker run --detach --name verify -p 8080:8080 "$IMAGE@${{ needs.build.outputs.digest }}"
           for i in $(seq 1 20); do curl -fsS localhost:8080/healthz && break; sleep 1; done
           curl -fsS localhost:8080/version
